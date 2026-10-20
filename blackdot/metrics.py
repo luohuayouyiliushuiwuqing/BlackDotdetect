@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import numpy as np
-from sklearn.metrics import (average_precision_score, confusion_matrix,
-                             precision_recall_fscore_support, roc_auc_score)
-
-from .synthesis import CLASS_NAMES
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 def binary_metrics(y_true: np.ndarray, score: np.ndarray,
                    thr: float = 0.5) -> dict:
-    """第一级 black_exist 二分类指标."""
+    """二分类指标 (1=无人机, 0=其他): P/R/F1 + 每 ROI 虚警率."""
     pred = score >= thr
     tp = int(((pred == 1) & (y_true == 1)).sum())
     fp = int(((pred == 1) & (y_true == 0)).sum())
@@ -24,21 +21,9 @@ def binary_metrics(y_true: np.ndarray, score: np.ndarray,
             "far_per_roi": fp / max(n_neg, 1)}
 
 
-def cls_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """第二级多分类指标: 混淆矩阵 + 各类 P/R/F1 + Macro-F1."""
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(CLASS_NAMES))))
-    p, r, f1, sup = precision_recall_fscore_support(
-        y_true, y_pred, labels=list(range(len(CLASS_NAMES))), zero_division=0)
-    per_cls = {CLASS_NAMES[i]: {"precision": float(p[i]), "recall": float(r[i]),
-                                "f1": float(f1[i]), "support": int(sup[i])}
-               for i in range(len(CLASS_NAMES))}
-    return {"confusion_matrix": cm, "per_class": per_cls,
-            "macro_f1": float(np.mean(f1))}
-
-
 def drone_pr(y_true: np.ndarray, drone_score: np.ndarray) -> dict:
-    """无人机 vs 其他: AUC / AP / 固定 FAR 下召回率 (核心指标)."""
-    y_bin = (y_true == 0).astype(int)
+    """无人机 vs 其他: AUC / AP / 固定 FAR 下召回率 (核心指标, 无人机为正类=1)."""
+    y_bin = (y_true == 1).astype(int)
     if y_bin.sum() == 0 or y_bin.sum() == len(y_bin):
         return {"auc": float("nan"), "ap": float("nan")}
     order = np.argsort(-drone_score)
@@ -56,22 +41,12 @@ def drone_pr(y_true: np.ndarray, drone_score: np.ndarray) -> dict:
     return out
 
 
-def report(y_true: np.ndarray, black_score: np.ndarray,
-           cls_pred: np.ndarray, drone_score: np.ndarray) -> str:
-    """汇总输出评估报告字符串."""
-    lines = ["=== 第一级: 黑色元素判定 ==="]
-    for k, v in binary_metrics((y_true != 3).astype(int), black_score).items():
+def report(y_true: np.ndarray, score: np.ndarray, thr: float = 0.5) -> str:
+    """汇总输出二分类评估报告字符串 (y_true: 1=无人机, 0=其他)."""
+    lines = ["=== 二分类: 是否无人机 ==="]
+    for k, v in binary_metrics(y_true, score, thr).items():
         lines.append(f"  {k}: {v:.4f}")
-    cm_r = cls_metrics(y_true, cls_pred)
-    lines.append("=== 第二级: 目标分类 ===")
-    lines.append(f"  macro_f1: {cm_r['macro_f1']:.4f}")
-    lines.append("  混淆矩阵 (行=真值, 列=预测; drone/sky_edge/cloud_edge/bg):")
-    for row in cm_r["confusion_matrix"]:
-        lines.append("    " + " ".join(f"{v:6d}" for v in row))
-    for name, m in cm_r["per_class"].items():
-        lines.append(f"  {name:12s} P={m['precision']:.3f} R={m['recall']:.3f} "
-                     f"F1={m['f1']:.3f} (n={m['support']})")
-    lines.append("=== 无人机 vs 其他 ===")
-    for k, v in drone_pr(y_true, drone_score).items():
+    lines.append("=== 无人机检测 (AUC / AP / 固定 FAR 下召回率) ===")
+    for k, v in drone_pr(y_true, score).items():
         lines.append(f"  {k}: {v:.4f}")
     return "\n".join(lines)

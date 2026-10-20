@@ -1,6 +1,6 @@
-"""规则基线评估 (设计方案 3.3 / 6.2 基线 1).
+"""规则基线评估 (设计方案 3.3 / 6.2 基线 1, 二分类对照).
 
-在合成测试集上运行规则基线, 输出与 CNN 相同的评估报告, 用于对比。
+在合成测试集上运行规则基线, 输出与 CNN 相同的二分类评估报告, 用于对比。
 用法: python scripts/baseline_eval.py --n-per-class 500
 """
 
@@ -26,18 +26,16 @@ def main() -> None:
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    ys, bs, preds, dscores = [], [], [], []
+    ys, scores = [], []
     for cls in range(4):
         for _ in range(args.n_per_class):
             img = synth_sample(rng, cls)
             r = rule_baseline(img)
-            ys.append(cls)
-            bs.append(1.0 if r["black_exist"] else 0.0)
-            preds.append(r["cls"])
-            # 规则法无概率输出, 用对比度近似无人机得分
-            dscores.append(float(r["features"][3]) if r["cls"] == 0 else 0.0)
+            ys.append(1 if cls == 0 else 0)            # 真值: 无人机=1
+            # 规则法无概率输出, 用闭合对比度近似无人机得分 (仅当规则判为团状无人机)
+            scores.append(float(r["features"][3]) if r["cls"] == 0 else 0.0)
 
-    print(report(np.array(ys), np.array(bs), np.array(preds), np.array(dscores)))
+    print(report(np.array(ys), np.array(scores)))
 
 
 if __name__ == "__main__":

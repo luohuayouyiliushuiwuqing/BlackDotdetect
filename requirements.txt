@@ -3,3 +3,6 @@ torch>=2.7
 numpy>=2.2
 opencv-python>=4.11
 scikit-learn>=1.7
+# 可选: 仅导出/校验 ONNX 时需要
+onnx>=1.15
+onnxruntime>=1.16

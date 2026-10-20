@@ -1,7 +1,11 @@
-"""训练双头 CNN 并输出评估报告 (设计方案 5/6).
+"""训练二分类 CNN (DroneNet) 并输出评估报告 (设计方案 5/6).
 
 示例:
-    python scripts/train.py --epochs 10 --n-per-class 3000 --device cuda
+    # 合成数据预训练 (无限在线合成, 先把特征学出来)
+    python scripts/train.py --epochs 30 --n-per-class 5000 --device cuda --out runs/synth_pre.pt
+    # 实拍数据微调 (加载合成预训练权重, 用小学习率)
+    python scripts/train.py --data-root data --init-from runs/synth_pre.pt \
+        --epochs 15 --lr 1e-4 --device cuda --out runs/finetune.pt
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from blackdot.dataset import FolderROIDataset, SyntheticROIDataset
 from blackdot.metrics import report
-from blackdot.model import DualHeadNet, FocalLoss, count_params
+from blackdot.model import DroneNet, BinaryFocalLoss, count_params
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,34 +34,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--lambda-cls", type=float, default=2.0, help="分类损失权重 λ2")
+    p.add_argument("--init-from", type=str, default="",
+                   help="预训练权重 .pt 路径, 用于合成预训练→实拍微调; 为空则随机初始化")
     p.add_argument("--no-handcrafted", action="store_true", help="消融: 去掉手工特征分支")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out", type=str, default="runs/dualhead.pt")
+    p.add_argument("--out", type=str, default="runs/dronenet.pt")
     return p.parse_args()
 
 
 @torch.no_grad()
 def evaluate(model, loader, device) -> tuple[float, str]:
     model.eval()
-    ys, bs, preds, dscores, losses = [], [], [], [], []
-    focal = FocalLoss(gamma=2.0).to(device)
-    for x, feat, cls, black in loader:
-        x, feat, cls, black = (x.to(device), feat.to(device),
-                               cls.to(device), black.to(device))
-        lb, lc = model(x, feat)
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(lb, black) \
-            + 2.0 * focal(lc, cls)
+    ys, scores, losses = [], [], []
+    focal = BinaryFocalLoss(gamma=2.0).to(device)
+    for x, feat, label in loader:
+        x, feat, label = (x.to(device), feat.to(device), label.to(device))
+        logit = model(x, feat)
+        loss = focal(logit, label)
         losses.append(loss.item())
-        ys.append(cls.cpu().numpy())
-        bs.append(torch.sigmoid(lb).cpu().numpy())
-        preds.append(lc.argmax(1).cpu().numpy())
-        dscores.append(torch.softmax(lc, 1)[:, 0].cpu().numpy())
+        ys.append(label.cpu().numpy().astype(int))
+        scores.append(torch.sigmoid(logit).cpu().numpy())
     y = np.concatenate(ys)
-    return float(np.mean(losses)), report(y, np.concatenate(bs),
-                                          np.concatenate(preds),
-                                          np.concatenate(dscores))
+    return float(np.mean(losses)), report(y, np.concatenate(scores))
 
 
 def main() -> None:
@@ -79,10 +78,19 @@ def main() -> None:
     val_ld = DataLoader(val_ds, batch_size=512, num_workers=2,
                         persistent_workers=True)
 
-    model = DualHeadNet(use_handcrafted=not args.no_handcrafted).to(device)
+    model = DroneNet(use_handcrafted=not args.no_handcrafted).to(device)
     print(f"参数量: {count_params(model):,}  设备: {device}")
 
-    focal = FocalLoss(gamma=2.0).to(device)
+    if args.init_from:
+        ckpt = torch.load(args.init_from, map_location=device, weights_only=False)
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[微调] 加载预训练权重 {args.init_from} "
+              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        if missing or unexpected:
+            print("[警告] 权重不完全匹配, 请确认 --no-handcrafted 设置与预训练时一致")
+
+    focal = BinaryFocalLoss(gamma=2.0).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
@@ -92,12 +100,10 @@ def main() -> None:
     for ep in range(1, args.epochs + 1):
         model.train()
         t0, tot = time.time(), 0.0
-        for x, feat, cls, black in train_ld:
-            x, feat, cls, black = (x.to(device), feat.to(device),
-                                   cls.to(device), black.to(device))
-            lb, lc = model(x, feat)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(lb, black) \
-                + args.lambda_cls * focal(lc, cls)
+        for x, feat, label in train_ld:
+            x, feat, label = (x.to(device), feat.to(device), label.to(device))
+            logit = model(x, feat)
+            loss = focal(logit, label)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()

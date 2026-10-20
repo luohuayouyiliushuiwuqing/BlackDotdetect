@@ -31,6 +31,17 @@ class _ProbWrapper(torch.nn.Module):
         return torch.sigmoid(self.net(roi, feat))
 
 
+class _ProbWrapperSingle(torch.nn.Module):
+    """纯 CNN 版 (use_handcrafted=False): 只吃 roi, 无需手工特征输入。"""
+
+    def __init__(self, net: DroneNet):
+        super().__init__()
+        self.net = net
+
+    def forward(self, roi):
+        return torch.sigmoid(self.net(roi, None))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, help="训练保存的 .pt 路径")
@@ -52,18 +63,26 @@ def main() -> int:
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     net.load_state_dict(state)
     net.eval()
-    model = _ProbWrapper(net)
 
+    # 按是否使用手工特征决定输入签名: 纯 CNN 版只需 roi, 便于整网放 NPU。
     dummy_roi = torch.zeros(1, 2, ROI, ROI)
-    dummy_feat = torch.zeros(1, NUM_HANDCRAFTED)
+    if use_hc:
+        model = _ProbWrapper(net)
+        dummy = (dummy_roi, torch.zeros(1, NUM_HANDCRAFTED))
+        input_names = ["roi", "feat"]
+        axes = {"roi": {0: "batch"}, "feat": {0: "batch"}, "prob": {0: "batch"}}
+    else:
+        model = _ProbWrapperSingle(net)
+        dummy = (dummy_roi,)
+        input_names = ["roi"]
+        axes = {"roi": {0: "batch"}, "prob": {0: "batch"}}
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     torch.onnx.export(
-        model, (dummy_roi, dummy_feat), str(out),
-        input_names=["roi", "feat"], output_names=["prob"],
-        dynamic_axes={"roi": {0: "batch"}, "feat": {0: "batch"}, "prob": {0: "batch"}},
-        opset_version=args.opset, do_constant_folding=True,
+        model, dummy, str(out),
+        input_names=input_names, output_names=["prob"],
+        dynamic_axes=axes, opset_version=args.opset, do_constant_folding=True,
     )
 
     # torch>=2.9 的新导出器会把大权重写成外部数据文件 (*.onnx.data),
@@ -77,7 +96,10 @@ def main() -> int:
         data_file.unlink()
     onnx.checker.check_model(m)
     print(f"ONNX 已导出并通过结构校验: {out}")
-    print(f"  输入: roi (batch,2,{ROI},{ROI}), feat (batch,{NUM_HANDCRAFTED})")
+    if use_hc:
+        print(f"  输入: roi (batch,2,{ROI},{ROI}), feat (batch,{NUM_HANDCRAFTED})")
+    else:
+        print(f"  输入: roi (batch,2,{ROI},{ROI})   # 纯 CNN, 无需手工特征")
     print("  输出: prob (batch,)  # sigmoid 概率")
     print(f"  opset={args.opset}, use_handcrafted={use_hc}")
     return 0

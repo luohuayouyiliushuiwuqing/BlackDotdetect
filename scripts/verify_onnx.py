@@ -74,14 +74,20 @@ def main() -> int:
     net = _load_torch(args.ckpt, device)
     x, feat = _prepare_inputs(args.n, args.seed)
 
+    # ONNX Runtime 会话 (先建, 便于读取输入签名: 纯 CNN 版只需 roi)
+    sess = ort.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])
+    use_feat = "feat" in {i.name for i in sess.get_inputs()}
+
     # PyTorch 推理
     with torch.no_grad():
-        prob_t = torch.sigmoid(net(torch.from_numpy(x).to(device),
-                                   torch.from_numpy(feat).to(device))).cpu().numpy()
+        f_t = torch.from_numpy(feat).to(device) if use_feat else None
+        prob_t = torch.sigmoid(net(torch.from_numpy(x).to(device), f_t)).cpu().numpy()
 
     # ONNX Runtime 推理
-    sess = ort.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])
-    prob_o = sess.run(["prob"], {"roi": x, "feat": feat})[0]
+    feed = {"roi": x}
+    if use_feat:
+        feed["feat"] = feat
+    prob_o = sess.run(["prob"], feed)[0]
 
     # 推理结果对比
     diff = np.abs(prob_t - prob_o)

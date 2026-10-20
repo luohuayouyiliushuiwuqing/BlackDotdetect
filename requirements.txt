@@ -1,0 +1,5 @@
+# 已验证环境: /home/igs/miniconda3/envs/yolov8 (Python 3.10)
+torch>=2.7
+numpy>=2.2
+opencv-python>=4.11
+scikit-learn>=1.7

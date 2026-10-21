@@ -32,8 +32,10 @@ def main() -> None:
             img = synth_sample(rng, cls)
             r = rule_baseline(img)
             ys.append(1 if cls == 0 else 0)            # 真值: 无人机=1
-            # 规则法无概率输出, 用闭合对比度近似无人机得分 (仅当规则判为团状无人机)
-            scores.append(float(r["features"][3]) if r["cls"] == 0 else 0.0)
+            # 规则法无概率输出: "检出黑色元素即报警"(传统算法行为), 得分用闭合对比度。
+            # 注意不能只在 cls==0 时给分 —— 那样未判为团状的样本得分恒为 0,
+            # 会掩盖"边缘类被误报"这一核心虚警现象, 使 P/R 失去意义。
+            scores.append(float(r["features"][3]) if r["black_exist"] else 0.0)
 
     print(report(np.array(ys), np.array(scores)))
 

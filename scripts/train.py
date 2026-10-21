@@ -1,11 +1,17 @@
 """训练二分类 CNN (DroneNet) 并输出评估报告 (设计方案 5/6).
 
+支持早停: 监控 val_loss / f1 / auc, 连续 --patience 轮无改善即停止, 并自动恢复最优权重。
+
 示例:
     # 合成数据预训练 (无限在线合成, 先把特征学出来)
     python scripts/train.py --epochs 30 --n-per-class 5000 --device cuda --out runs/synth_pre.pt
     # 实拍数据微调 (加载合成预训练权重, 用小学习率)
     python scripts/train.py --data-root data --init-from runs/synth_pre.pt \
         --epochs 15 --lr 1e-4 --device cuda --out runs/finetune.pt
+    # 按业务指标早停 (低虚警下召回优先时推荐监控 f1 或 auc)
+    python scripts/train.py --data-root data --epochs 60 --monitor f1 --patience 10
+    # 关闭早停, 跑满轮数
+    python scripts/train.py --epochs 30 --patience 0
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from blackdot.dataset import FolderROIDataset, SyntheticROIDataset
-from blackdot.metrics import report
+from blackdot.metrics import binary_metrics, drone_pr, report
 from blackdot.model import DroneNet, BinaryFocalLoss, count_params
 
 
@@ -40,11 +46,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=str, default="runs/dronenet.pt")
+    p.add_argument("--patience", type=int, default=8,
+                   help="早停: 连续 N 轮监控指标无改善即停止; 0=关闭早停")
+    p.add_argument("--min-delta", type=float, default=1e-4,
+                   help="早停: 视为'有改善'的最小变化量")
+    p.add_argument("--monitor", choices=["val_loss", "f1", "auc"], default="val_loss",
+                   help="早停/择优监控指标: val_loss(越小越好) 或 f1/auc(越大越好)")
     return p.parse_args()
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> tuple[float, str]:
+def evaluate(model, loader, device) -> tuple[float, str, dict]:
+    """返回 (val_loss, 报告字符串, 指标字典) —— 指标字典供早停监控使用。"""
     model.eval()
     ys, scores, losses = [], [], []
     focal = BinaryFocalLoss(gamma=2.0).to(device)
@@ -56,7 +69,9 @@ def evaluate(model, loader, device) -> tuple[float, str]:
         ys.append(label.cpu().numpy().astype(int))
         scores.append(torch.sigmoid(logit).cpu().numpy())
     y = np.concatenate(ys)
-    return float(np.mean(losses)), report(y, np.concatenate(scores))
+    s = np.concatenate(scores)
+    metrics = {**binary_metrics(y, s), **drone_pr(y, s)}
+    return float(np.mean(losses)), report(y, s), metrics
 
 
 def main() -> None:
@@ -94,9 +109,14 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
+    # 早停: 统一转成"越大越好"的分数 (val_loss 取负)
     best = float("-inf")
+    best_state: dict | None = None      # 最优权重快照, 早停后恢复
+    bad_epochs = 0
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    stopped_epoch = 0
+
     for ep in range(1, args.epochs + 1):
         model.train()
         t0, tot = time.time(), 0.0
@@ -109,17 +129,34 @@ def main() -> None:
             opt.step()
             tot += loss.item()
         sch.step()
-        val_loss, _ = evaluate(model, val_ld, device)
+        val_loss, _, m = evaluate(model, val_ld, device)
+        cur = -val_loss if args.monitor == "val_loss" else float(m[args.monitor])
+        shown = val_loss if args.monitor == "val_loss" else cur
         print(f"[epoch {ep:02d}] train_loss={tot / len(train_ld):.4f} "
-              f"val_loss={val_loss:.4f} ({time.time() - t0:.1f}s)")
-        score = -val_loss
-        if score > best:
-            best = score
-            torch.save({"model": model.state_dict(), "args": vars(args)}, out_path)
+              f"val_loss={val_loss:.4f} {args.monitor}={shown:.4f} "
+              f"({time.time() - t0:.1f}s)")
 
-    model.load_state_dict(torch.load(out_path, weights_only=False)["model"])
-    val_loss, rep = evaluate(model, val_ld, device)
-    print(f"\n最优模型已保存到 {out_path}\n\n{rep}")
+        if cur > best + args.min_delta:
+            best = cur
+            bad_epochs = 0
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+            torch.save({"model": model.state_dict(), "args": vars(args),
+                        "monitor": args.monitor, "best_score": float(cur)},
+                       out_path)
+        else:
+            bad_epochs += 1
+            if args.patience > 0 and bad_epochs >= args.patience:
+                stopped_epoch = ep
+                print(f"[早停] {args.monitor} 连续 {bad_epochs} 轮无改善 "
+                      f"(阈值 min_delta={args.min_delta}), 在第 {ep} 轮停止训练")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)   # 恢复最优权重, 避免停在过拟合的最后一轮
+    _, rep, _ = evaluate(model, val_ld, device)
+    tail = f" (早停于第 {stopped_epoch} 轮)" if stopped_epoch else ""
+    print(f"\n最优模型已保存到 {out_path} [监控 {args.monitor}]{tail}\n\n{rep}")
 
 
 if __name__ == "__main__":

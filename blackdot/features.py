@@ -20,6 +20,7 @@ MIN_COMPACTNESS = 0.35  # 紧凑度阈值 4*pi*A/P^2
 MIN_CONTRAST = 0.12    # 最小闭合对比度 (模糊退化后目标芯对比度约 0.1~0.4)
 
 NUM_HANDCRAFTED = 8    # 手工特征维度
+CORE = 20              # 目标区边长: 36x36 画布中心 20x20 为目标区, 外圈 8px 为背景环带
 
 
 def bg_stats(roi: np.ndarray, ring: int = 8) -> tuple[float, float]:
@@ -36,6 +37,18 @@ def bg_stats(roi: np.ndarray, ring: int = 8) -> tuple[float, float]:
     else:
         bg = roi.reshape(-1)
     return float(bg.mean()), float(bg.std() + 1e-6)
+
+
+def core_region(roi: np.ndarray, ring: int = 8) -> np.ndarray:
+    """截取中心目标区 (36x36 -> 中心 20x20); 无上下文环带时返回原图.
+
+    阈值常量按 20x20 目标区标定, 暗像素统计必须只在目标区内进行,
+    背景统计量则来自外圈环带 (bg_stats), 否则占比阈值会随画布尺寸失效。
+    """
+    h, w = roi.shape
+    if h > 2 * ring + 4 and w > 2 * ring + 4:
+        return roi[ring:h - ring, ring:w - ring]
+    return roi
 
 
 def dark_mask(roi: np.ndarray, mu_bg: float, sigma_bg: float,
@@ -63,7 +76,6 @@ def gradient_symmetry(roi: np.ndarray, comp: np.ndarray) -> float:
     ys, xs = np.nonzero(comp)
     if len(ys) < 3:
         return 0.0
-    cx, cy = xs.mean(), ys.mean()
     gx = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
     mag = np.hypot(gx, gy)[comp > 0]
@@ -80,12 +92,17 @@ def gradient_symmetry(roi: np.ndarray, comp: np.ndarray) -> float:
 
 def handcrafted_features(roi: np.ndarray, mu_bg: float | None = None,
                          sigma_bg: float | None = None) -> np.ndarray:
-    """8 维手工结构特征 (设计方案 4.2)."""
+    """8 维手工结构特征 (设计方案 4.2).
+
+    暗像素统计只在中心目标区 (20x20) 内进行, 背景均值/标准差来自外圈环带,
+    保证占比/面积类特征与阈值常量在同一尺度上。
+    """
     roi = roi.astype(np.float32)
     if mu_bg is None or sigma_bg is None:
         mu_bg, sigma_bg = bg_stats(roi)
-    mask = dark_mask(roi, mu_bg, sigma_bg)
-    total = float(roi.size)
+    core = core_region(roi)
+    mask = dark_mask(core, mu_bg, sigma_bg)
+    total = float(core.size)
 
     dark_ratio = mask.sum() / total
     area, comp = _largest_component(mask)
@@ -99,16 +116,16 @@ def handcrafted_features(roi: np.ndarray, mu_bg: float | None = None,
         compact = 0.0
 
     # 闭合对比度
-    blob_mean = float(roi[comp > 0].mean()) if area > 0 else mu_bg
+    blob_mean = float(core[comp > 0].mean()) if area > 0 else mu_bg
     contrast = max((mu_bg - blob_mean) / max(mu_bg, 1e-6), 0.0)
 
-    sym = gradient_symmetry(roi, comp)
+    sym = gradient_symmetry(core, comp)
 
     # 质心偏移 (归一化到 [-1, 1])
     ys, xs = np.nonzero(comp)
     if area > 0:
-        off_x = (xs.mean() / roi.shape[1] - 0.5) * 2.0
-        off_y = (ys.mean() / roi.shape[0] - 0.5) * 2.0
+        off_x = (xs.mean() / core.shape[1] - 0.5) * 2.0
+        off_y = (ys.mean() / core.shape[0] - 0.5) * 2.0
         centroid_off = float(np.hypot(off_x, off_y))
     else:
         centroid_off = 0.0
@@ -146,7 +163,7 @@ def rule_baseline(roi: np.ndarray, mu_bg: float | None = None,
         mu_bg, sigma_bg = bg_stats(roi_f)
     feat = handcrafted_features(roi_f, mu_bg, sigma_bg)
     dark_ratio, area_ratio, compact, contrast, sym = feat[:5]
-    area = area_ratio * roi_f.size
+    area = area_ratio * core_region(roi_f).size   # 面积换算回像素数 (目标区尺度)
 
     exist = (dark_ratio >= MIN_DARK_RATIO and area >= MIN_BLOB_AREA
              and compact >= MIN_COMPACTNESS and contrast >= MIN_CONTRAST)
@@ -154,7 +171,8 @@ def rule_baseline(roi: np.ndarray, mu_bg: float | None = None,
     cls = 3
     if exist:
         # 粗判: 闭合对称团状→无人机; 条带/低紧凑→天空边缘; 低对比弥散→云层边缘
-        if sym >= 0.4 and compact >= 0.5:
+        # sym 实测: 无人机中位 ~0.30, 天空边缘 ~0.00 -> 阈值取 0.15 更有效分离
+        if sym >= 0.15 and compact >= 0.35:
             cls = 0
         elif compact < 0.5 and feat[7] * 10.0 > 2.0:
             cls = 1

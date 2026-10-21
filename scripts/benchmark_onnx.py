@@ -91,11 +91,14 @@ def main() -> int:
         fb = np.stack(fs) if use_feat else None
         return sess.run(["prob"], _feed(np.stack(xs), fb))
 
-    t_e2e = _bench(lambda: _e2e(imgs[:30]), max(args.repeats // 2, 5))
-    verdict = "达标" if t_e2e <= args.budget_ms else \
+    n_e2e = 30
+    t_e2e = _bench(lambda: _e2e(imgs[:n_e2e]), max(args.repeats // 2, 5))
+    # 预算是"每 ROI"口径, 必须与批总耗时对齐后再比较
+    per_roi = t_e2e / n_e2e
+    verdict = "达标" if per_roi <= args.budget_ms else \
         "不达标 -> 建议 NPU INT8 / GPU FP16 / 放宽预算"
-    print(f"C) 端到端 batch=30 (预处理+推理): {t_e2e:.3f} ms "
-          f"(预算 {args.budget_ms} ms -> {verdict})")
+    print(f"C) 端到端 batch={n_e2e} (预处理+推理): 批总 {t_e2e:.3f} ms, "
+          f"折合 {per_roi:.3f} ms/ROI (预算 {args.budget_ms} ms/ROI -> {verdict})")
     return 0
 
 

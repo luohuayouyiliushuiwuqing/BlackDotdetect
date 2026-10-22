@@ -23,36 +23,30 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from blackdot.dataset import encode_roi
-from blackdot.features import NUM_HANDCRAFTED
 from blackdot.model import DroneNet
 from blackdot.synthesis import ROI, synth_sample
 
 
 def _load_torch(ckpt_path: str, device: torch.device) -> DroneNet:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    meta = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    use_hc = not meta.get("no_handcrafted", False)
-    net = DroneNet(use_handcrafted=use_hc).to(device)
+    net = DroneNet().to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     net.load_state_dict(state)
     net.eval()
     return net
 
 
-def _prepare_inputs(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def _prepare_inputs(n: int, seed: int) -> np.ndarray:
     """输入数据准备: 合成样本(真实分布) + 随机输入(极端值域, 检验数值鲁棒性)."""
     rng = np.random.default_rng(seed)
-    xs, feats = [], []
+    xs = []
     for cls in range(4):                       # 合成: 覆盖 4 类语义
         for _ in range(n):
-            x, feat = encode_roi(synth_sample(rng, cls))
-            xs.append(x)
-            feats.append(feat)
+            xs.append(encode_roi(synth_sample(rng, cls)))
     for _ in range(n):                          # 随机: 边界覆盖
         xs.append(np.stack([rng.uniform(0, 1, (ROI, ROI)).astype(np.float32),
                             np.ones((ROI, ROI), np.float32)]))
-        feats.append(rng.uniform(0, 1, NUM_HANDCRAFTED).astype(np.float32))
-    return np.stack(xs).astype(np.float32), np.stack(feats).astype(np.float32)
+    return np.stack(xs).astype(np.float32)
 
 
 def main() -> int:
@@ -72,22 +66,20 @@ def main() -> int:
 
     device = torch.device("cpu")  # 对比统一在 CPU, 消除设备差异
     net = _load_torch(args.ckpt, device)
-    x, feat = _prepare_inputs(args.n, args.seed)
+    x = _prepare_inputs(args.n, args.seed)
 
-    # ONNX Runtime 会话 (先建, 便于读取输入签名: 纯 CNN 版只需 roi)
+    # ONNX Runtime 会话
     sess = ort.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])
-    use_feat = "feat" in {i.name for i in sess.get_inputs()}
+    if "feat" in {i.name for i in sess.get_inputs()}:
+        print("[错误] ONNX 含手工特征输入 'feat', 与本纯 CNN 模型不符")
+        return 1
 
     # PyTorch 推理
     with torch.no_grad():
-        f_t = torch.from_numpy(feat).to(device) if use_feat else None
-        prob_t = torch.sigmoid(net(torch.from_numpy(x).to(device), f_t)).cpu().numpy()
+        prob_t = torch.sigmoid(net(torch.from_numpy(x).to(device))).cpu().numpy()
 
     # ONNX Runtime 推理
-    feed = {"roi": x}
-    if use_feat:
-        feed["feat"] = feat
-    prob_o = sess.run(["prob"], feed)[0]
+    prob_o = sess.run(["prob"], {"roi": x})[0]
 
     # 推理结果对比
     diff = np.abs(prob_t - prob_o)

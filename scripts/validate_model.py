@@ -27,15 +27,13 @@ from blackdot.model import DroneNet
 from blackdot.synthesis import synth_sample
 
 
-def load_model(ckpt_path: str, device: torch.device):
+def load_model(ckpt_path: str, device: torch.device) -> DroneNet:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    meta = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    use_hc = not meta.get("no_handcrafted", False)
-    model = DroneNet(use_handcrafted=use_hc).to(device)
+    model = DroneNet().to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state)          # strict: 架构不一致应直接报错
     model.eval()
-    return model, use_hc
+    return model
 
 
 def _report(checks, extra=None) -> None:
@@ -61,8 +59,8 @@ def main() -> int:
 
     # 1) 加载
     try:
-        model, use_hc = load_model(args.ckpt, device)
-        checks.append(("权重加载(架构一致)", True, f"use_handcrafted={use_hc}"))
+        model = load_model(args.ckpt, device)
+        checks.append(("权重加载(架构一致)", True, "DroneNet 纯 CNN"))
     except Exception as e:  # noqa: BLE001
         checks.append(("权重加载(架构一致)", False, str(e)))
         _report(checks)
@@ -70,21 +68,18 @@ def main() -> int:
 
     # 2) 输入数据准备 (合成, 覆盖 4 类语义 -> 二分类标签)
     rng = np.random.default_rng(args.seed)
-    xs, feats, ys = [], [], []
+    xs, ys = [], []
     for cls in range(4):
         for _ in range(args.n):
             img = synth_sample(rng, cls)
-            x, feat = encode_roi(img)
-            xs.append(x)
-            feats.append(feat)
+            xs.append(encode_roi(img))
             ys.append(1 if cls == 0 else 0)
     x = torch.from_numpy(np.stack(xs)).to(device)
-    feat = torch.from_numpy(np.stack(feats)).to(device)
     y = np.array(ys)
 
     # 3) 前向推理
     with torch.no_grad():
-        prob = torch.sigmoid(model(x, feat)).cpu().numpy()
+        prob = torch.sigmoid(model(x)).cpu().numpy()
 
     checks.append(("输出形状 (N,)", prob.shape == (len(y),), f"got {prob.shape}"))
     checks.append(("无 NaN/Inf", bool(np.isfinite(prob).all()), ""))

@@ -5,7 +5,7 @@
     0 = 无人机 (正类, label=1), 1 = 天空边缘, 2 = 云层边缘, 3 = 纯背景
     后三类均为负类 (label=0); 它们是与无人机最易混淆的"暗边缘/暗区"样本。
 
-样本张量: 36x36x2 (Y 归一化 [0,1] + 有效像素掩码), 附带 8 维手工特征。
+样本张量: 36x36x2 (Y 归一化 [0,1] + 有效像素掩码)。
 目标应大致居中, 外圈 8px 为背景, 与合成管线保持一致。
 """
 
@@ -18,20 +18,17 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .features import handcrafted_features
 from .synthesis import ROI, synth_sample
 
 
-def encode_roi(roi_gray: np.ndarray, out: int = ROI) -> tuple[np.ndarray, np.ndarray]:
-    """将任意尺寸 Y ROI 编码为 (2, out, out) 张量 + 8 维手工特征.
+def encode_roi(roi_gray: np.ndarray, out: int = ROI) -> np.ndarray:
+    """将任意尺寸 Y ROI 编码为 (2, out, out) 张量.
 
     尺度处理原则 (方案 B): **绝不放大**
       - ROI > out : 等比缩小到最长边 = out (INTER_AREA, 保留全部内容, 不裁掉周围),
                     再居中填充到 out×out, 填充区掩码置 0
       - ROI < out : 居中放入 out 画布, 四周填 0 且掩码置 0 (保持像素尺度, 不放大)
     小目标因此永远不会被拉伸放大; 掩码通道告知网络哪些区域是填充。
-
-    手工特征只在**有效区域**上计算, 避免把填充的 0 当成暗像素。
     """
     roi_gray = np.asarray(roi_gray)
     h, w = roi_gray.shape
@@ -53,9 +50,7 @@ def encode_roi(roi_gray: np.ndarray, out: int = ROI) -> tuple[np.ndarray, np.nda
     canvas[oy:oy + ch, ox:ox + cw] = patch[sy:sy + ch, sx:sx + cw] / 255.0
     mask[oy:oy + ch, ox:ox + cw] = 1.0
 
-    x = np.stack([canvas, mask])                   # (2, out, out)
-    feat = handcrafted_features(patch.astype(np.float32))
-    return x, feat
+    return np.stack([canvas, mask])                # (2, out, out)
 
 
 def augment(rng: np.random.Generator, img: np.ndarray) -> np.ndarray:
@@ -106,10 +101,9 @@ class SyntheticROIDataset(Dataset):
         img = synth_sample(rng, cls, valid_size=valid)
         if self.train:
             img = augment(rng, img)
-        x, feat = encode_roi(img)
+        x = encode_roi(img)
         is_drone = 1.0 if cls == 0 else 0.0
-        return (torch.from_numpy(x), torch.from_numpy(feat),
-                torch.tensor(is_drone, dtype=torch.float32))
+        return (torch.from_numpy(x), torch.tensor(is_drone, dtype=torch.float32))
 
 
 # 正类子目录名 (不区分大小写): 位于这些目录下的图像视为"飞机/无人机"正样本
@@ -155,6 +149,5 @@ class FolderROIDataset(Dataset):
         img = img.astype(np.float32)   # 不 resize: 由 encode_roi 居中处理, 保持尺度
         if self.train:
             img = augment(self.rng, img)
-        x, feat = encode_roi(img)
-        return (torch.from_numpy(x), torch.from_numpy(feat),
-                torch.tensor(float(is_drone), dtype=torch.float32))
+        x = encode_roi(img)
+        return (torch.from_numpy(x), torch.tensor(float(is_drone), dtype=torch.float32))

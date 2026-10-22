@@ -55,8 +55,8 @@ class DroneClassifier:
         names = {i.name for i in self.sess.get_inputs()}
         if "feat" in names:
             raise RuntimeError(
-                "该 ONNX 需要 8 维手工特征输入 'feat'(依赖训练期实现)。\n"
-                "部署请用纯 CNN 模型: python scripts/train.py --no-handcrafted ...\n"
+                "该 ONNX 需要 8 维手工特征输入 'feat'(旧版模型)。\n"
+                "请用纯 CNN 模型重新训练并导出: python scripts/train.py ... \n"
                 "再用 scripts/export_onnx.py 导出 (输入签名应只有 'roi')。")
         if self.input_name != "roi":
             raise RuntimeError(f"意外的输入签名: {names}, 期望 'roi'")

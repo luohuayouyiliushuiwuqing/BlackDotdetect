@@ -1,9 +1,11 @@
-"""轻量二分类 CNN (设计方案 4.1, 改造为"是否无人机"二分类).
+"""轻量二分类 CNN (纯 CNN, 无手工特征分支).
+
+模型契约:
+    输入 : (B, 2, 36, 36)  float32, 通道0=Y/255, 通道1=有效像素掩码
+    输出 : (B,) logits -> sigmoid -> P(dot)
 
 骨干: 4 层卷积 + SE 注意力, 不使用池化降采样以保留微小目标空间信息;
-融合 8 维手工结构特征后接单个二分类头:
-    head: sigmoid -> P(无人机)
-输入为 36x36x2 (Y + 掩码), 目标居中、外圈 8px 为背景。参数量约 7.6 万,
+GlobalAvgPool + GlobalMaxPool 拼接后接单二分类头。参数量约 7.6 万,
 CPU 单 ROI 推理 < 0.1ms 量级, 适合嵌入式机载部署。
 """
 
@@ -12,8 +14,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .features import NUM_HANDCRAFTED
 
 
 class SEBlock(nn.Module):
@@ -39,43 +39,32 @@ class ConvBN(nn.Module):
 
 
 class DroneNet(nn.Module):
-    """二分类: 输入 (B, 2, 36, 36) + 手工特征 (B, 8) -> P(无人机)."""
+    """二分类: 输入 (B, 2, 36, 36) -> logits (B,)."""
 
-    def __init__(self, in_ch: int = 2, n_feat: int = NUM_HANDCRAFTED,
-                 use_handcrafted: bool = True):
+    def __init__(self, in_ch: int = 2):
         super().__init__()
-        self.use_handcrafted = use_handcrafted
         self.backbone = nn.Sequential(
-            ConvBN(in_ch, 16),            # 36 -> 34
-            ConvBN(16, 32),               # 34 -> 32
+            ConvBN(in_ch, 16),             # 36 -> 34
+            ConvBN(16, 32),                # 34 -> 32
             SEBlock(32),
-            ConvBN(32, 64),               # 32 -> 30
+            ConvBN(32, 64),                # 32 -> 30
             SEBlock(64),
-            ConvBN(64, 64),               # 30 -> 28
+            ConvBN(64, 64),                # 30 -> 28
         )
-        fused = 128 + (n_feat if use_handcrafted else 0)
-        self.fc = nn.Sequential(nn.Linear(fused, 96), nn.ReLU(inplace=True))
+        self.fc = nn.Sequential(nn.Linear(128, 96), nn.ReLU(inplace=True))
         self.head = nn.Linear(96, 1)
 
-    def forward(self, x: torch.Tensor, feat: torch.Tensor | None = None
-                ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         f = self.backbone(x)                       # (B, 64, 28, 28)
         gap = f.mean(dim=(2, 3))
         gmp = f.amax(dim=(2, 3))
         z = torch.cat([gap, gmp], dim=1)           # (B, 128)
-        if self.use_handcrafted:
-            if feat is None:
-                raise ValueError("use_handcrafted=True 时必须传入手工特征")
-            z = torch.cat([z, feat], dim=1)
-        z = self.fc(z)
-        return self.head(z).squeeze(1)
+        return self.head(self.fc(z)).squeeze(1)
 
     @torch.no_grad()
-    def predict(self, x: torch.Tensor, feat: torch.Tensor | None = None
-                ) -> dict[str, torch.Tensor]:
-        """返回无人机概率与综合置信度。"""
-        p = torch.sigmoid(self.forward(x, feat))
-        return {"is_drone": p, "confidence": p}
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """返回 P(dot) 概率。"""
+        return torch.sigmoid(self.forward(x))
 
 
 def count_params(model: nn.Module) -> int:
@@ -85,8 +74,8 @@ def count_params(model: nn.Module) -> int:
 class BinaryFocalLoss(nn.Module):
     """二分类 Focal Loss (gamma=2, 缓解正样本稀少).
 
-    正样本 (无人机) 在合成数据中约占 1/4, 实拍中占比可能更低; Focal 通过
-    下调易分样本权重, 让模型聚焦难分样本与少数正类。
+    正样本 (dot) 在实拍中占比往往更低; Focal 通过下调易分样本权重,
+    让模型聚焦难分样本与少数正类。pos_weight 用于处理正负类不平衡。
     """
 
     def __init__(self, gamma: float = 2.0,

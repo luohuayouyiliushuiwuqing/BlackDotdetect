@@ -28,12 +28,10 @@ from blackdot.model import DroneNet
 
 def load_model(ckpt: str, device: torch.device) -> DroneNet:
     ckpt_data = torch.load(ckpt, map_location=device, weights_only=False)
-    meta = ckpt_data.get("args", {}) if isinstance(ckpt_data, dict) else {}
-    use_hc = not meta.get("no_handcrafted", False)
-    net = DroneNet(use_handcrafted=use_hc).to(device)
+    net = DroneNet().to(device)
     state = ckpt_data["model"] if isinstance(ckpt_data, dict) and "model" in ckpt_data \
         else ckpt_data
-    net.load_state_dict(state)          # strict: 架构/开关不一致应直接报错
+    net.load_state_dict(state)          # strict: 架构不一致应直接报错
     net.eval()
     return net
 
@@ -41,9 +39,9 @@ def load_model(ckpt: str, device: torch.device) -> DroneNet:
 @torch.no_grad()
 def run(model, loader, device):
     ys, probs = [], []
-    for x, feat, label in loader:
-        x, feat = x.to(device), feat.to(device)
-        p = torch.sigmoid(model(x, feat)).cpu().numpy()
+    for x, label in loader:
+        x = x.to(device)
+        p = torch.sigmoid(model(x)).cpu().numpy()
         probs.append(p)
         ys.append(label.numpy().astype(int))
     return np.concatenate(ys), np.concatenate(probs)

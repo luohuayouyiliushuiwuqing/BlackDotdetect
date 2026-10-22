@@ -42,7 +42,7 @@ python scripts/split_data.py --src data/base_data --dst data
 
 # 1) 纯实拍训练 (不使用合成数据; 正负比 1:3 时务必加 --pos-weight auto)
 python scripts/train.py --data-root data --epochs 80 --batch-size 32 --lr 3e-4 \
-    --monitor f1 --patience 15 --pos-weight auto --no-handcrafted --out runs/dronenet.pt
+    --monitor f1 --patience 15 --pos-weight auto --out runs/dronenet.pt
 
 # 2) 模型校验
 python scripts/validate_model.py --ckpt runs/dronenet.pt

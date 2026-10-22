@@ -69,14 +69,12 @@ def build(exp_dir: Path, pool: dict, val_clip: str) -> tuple[int, int]:
 
 
 def run(exp_dir: Path, epochs: int, batch: int, lr: float, monitor: str,
-        patience: int, no_handcrafted: bool) -> str:
+        patience: int) -> str:
     cmd = [sys.executable, str(ROOT / "scripts" / "train.py"),
            "--data-root", str(exp_dir), "--epochs", str(epochs),
            "--batch-size", str(batch), "--lr", str(lr),
            "--monitor", monitor, "--patience", str(patience),
            "--out", str(exp_dir / "model.pt")]
-    if no_handcrafted:
-        cmd.append("--no-handcrafted")
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT))
     if res.returncode != 0:
         return f"[失败] {res.stderr[-1500:]}"
@@ -91,7 +89,6 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--monitor", default="f1", choices=["f1", "auc", "val_loss"])
     ap.add_argument("--patience", type=int, default=10)
-    ap.add_argument("--no-handcrafted", action="store_true")
     ap.add_argument("--min-clip-samples", type=int, default=20,
                     help="样本数少于该值的视频段不单独做验证集")
     ap.add_argument("--out-dir", default=str(ROOT / "runs" / "cv"))
@@ -115,7 +112,7 @@ def main() -> int:
         print(f"\n{'=' * 62}\n留一段验证: val={val_clip} "
               f"(train {n_tr} 张 / val {n_va} 张)\n{'=' * 62}")
         out = run(exp, args.epochs, args.batch_size, args.lr, args.monitor,
-                  args.patience, args.no_handcrafted)
+                  args.patience)
         print(out)
         for line in out.splitlines():
             if line.strip().startswith("f1:"):

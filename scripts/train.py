@@ -42,7 +42,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--init-from", type=str, default="",
                    help="预训练权重 .pt 路径, 用于合成预训练→实拍微调; 为空则随机初始化")
-    p.add_argument("--no-handcrafted", action="store_true", help="消融: 去掉手工特征分支")
     p.add_argument("--pos-weight", default="none",
                    help="正样本(无人机)损失权重: none(默认) | auto(按 train 集 n_neg/n_pos 自动) "
                         "| 具体数值。纯实拍训练且正负比 >2:1 时建议 auto")
@@ -66,9 +65,9 @@ def evaluate(model, loader, device,
     ys, scores, losses = [], [], []
     if focal is None:
         focal = BinaryFocalLoss(gamma=2.0).to(device)
-    for x, feat, label in loader:
-        x, feat, label = (x.to(device), feat.to(device), label.to(device))
-        logit = model(x, feat)
+    for x, label in loader:
+        x, label = x.to(device), label.to(device)
+        logit = model(x)
         loss = focal(logit, label)
         losses.append(loss.item())
         ys.append(label.cpu().numpy().astype(int))
@@ -113,7 +112,7 @@ def main() -> None:
         print(f"[建议] 训练集仅 {n_train} 张, 每 epoch 只有 {len(train_ld)} 次参数更新; "
               f"建议 --batch-size 16~32 (并相应增大 --epochs), 否则几乎学不到东西")
 
-    model = DroneNet(use_handcrafted=not args.no_handcrafted).to(device)
+    model = DroneNet().to(device)
     print(f"参数量: {count_params(model):,}  设备: {device}")
 
     if args.init_from:
@@ -123,7 +122,7 @@ def main() -> None:
         print(f"[微调] 加载预训练权重 {args.init_from} "
               f"(missing={len(missing)}, unexpected={len(unexpected)})")
         if missing or unexpected:
-            print("[警告] 权重不完全匹配, 请确认 --no-handcrafted 设置与预训练时一致")
+            print("[警告] 权重不完全匹配, 请确认预训练模型与本架构一致")
 
     # 正样本加权: 纯实拍训练时正负比常达 1:3, 不加权模型会偏向预测负类、召回偏低
     pos_weight = None
@@ -155,9 +154,9 @@ def main() -> None:
     for ep in range(1, args.epochs + 1):
         model.train()
         t0, tot = time.time(), 0.0
-        for x, feat, label in train_ld:
-            x, feat, label = (x.to(device), feat.to(device), label.to(device))
-            logit = model(x, feat)
+        for x, label in train_ld:
+            x, label = x.to(device), label.to(device)
+            logit = model(x)
             loss = focal(logit, label)
             opt.zero_grad(set_to_none=True)
             loss.backward()

@@ -1,6 +1,6 @@
-"""将训练好的 DroneNet 导出为 ONNX.
+"""将训练好的 DroneNet (纯 CNN) 导出为 ONNX.
 
-用法: python scripts/export_onnx.py --ckpt runs/finetune.pt --out runs/dronenet.onnx [--opset 17]
+用法: python scripts/export_onnx.py --ckpt runs/dronenet.pt --out runs/dronenet.onnx [--opset 17]
 依赖: pip install onnx
 导出后用 scripts/verify_onnx.py 校验与 PyTorch 输出一致性。
 """
@@ -15,7 +15,6 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from blackdot.features import NUM_HANDCRAFTED
 from blackdot.model import DroneNet
 from blackdot.synthesis import ROI
 
@@ -27,19 +26,8 @@ class _ProbWrapper(torch.nn.Module):
         super().__init__()
         self.net = net
 
-    def forward(self, roi, feat):
-        return torch.sigmoid(self.net(roi, feat))
-
-
-class _ProbWrapperSingle(torch.nn.Module):
-    """纯 CNN 版 (use_handcrafted=False): 只吃 roi, 无需手工特征输入。"""
-
-    def __init__(self, net: DroneNet):
-        super().__init__()
-        self.net = net
-
     def forward(self, roi):
-        return torch.sigmoid(self.net(roi, None))
+        return torch.sigmoid(self.net(roi))
 
 
 def main() -> int:
@@ -57,30 +45,20 @@ def main() -> int:
 
     device = torch.device("cpu")  # 固定 CPU 导出, 保证可复现
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    meta = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    use_hc = not meta.get("no_handcrafted", False)
-    net = DroneNet(use_handcrafted=use_hc).to(device)
+    net = DroneNet().to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     net.load_state_dict(state)
     net.eval()
 
-    # 按是否使用手工特征决定输入签名: 纯 CNN 版只需 roi, 便于整网放 NPU。
+    model = _ProbWrapper(net)
     dummy_roi = torch.zeros(1, 2, ROI, ROI)
-    if use_hc:
-        model = _ProbWrapper(net)
-        dummy = (dummy_roi, torch.zeros(1, NUM_HANDCRAFTED))
-        input_names = ["roi", "feat"]
-        axes = {"roi": {0: "batch"}, "feat": {0: "batch"}, "prob": {0: "batch"}}
-    else:
-        model = _ProbWrapperSingle(net)
-        dummy = (dummy_roi,)
-        input_names = ["roi"]
-        axes = {"roi": {0: "batch"}, "prob": {0: "batch"}}
+    input_names = ["roi"]
+    axes = {"roi": {0: "batch"}, "prob": {0: "batch"}}
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     torch.onnx.export(
-        model, dummy, str(out),
+        model, (dummy_roi,), str(out),
         input_names=input_names, output_names=["prob"],
         dynamic_axes=axes, opset_version=args.opset, do_constant_folding=True,
     )
@@ -96,12 +74,9 @@ def main() -> int:
         data_file.unlink()
     onnx.checker.check_model(m)
     print(f"ONNX 已导出并通过结构校验: {out}")
-    if use_hc:
-        print(f"  输入: roi (batch,2,{ROI},{ROI}), feat (batch,{NUM_HANDCRAFTED})")
-    else:
-        print(f"  输入: roi (batch,2,{ROI},{ROI})   # 纯 CNN, 无需手工特征")
+    print(f"  输入: roi (batch,2,{ROI},{ROI})   # 纯 CNN, 无手工特征")
     print("  输出: prob (batch,)  # sigmoid 概率")
-    print(f"  opset={args.opset}, use_handcrafted={use_hc}")
+    print(f"  opset={args.opset}")
     return 0
 
 

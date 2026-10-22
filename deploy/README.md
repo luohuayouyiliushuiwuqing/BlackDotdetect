@@ -79,10 +79,10 @@ probs = clf.predict_proba(list_of_rois)            # 批量 P(dot)
 
 ```bash
 # 训练侧导出 (项目根目录):
-python scripts/train.py --data-root data --no-handcrafted ... --out runs/m.pt
+python scripts/train.py --data-root data ... --out runs/m.pt
 python scripts/export_onnx.py --ckpt runs/m.pt --out deploy/model.onnx
 ```
 
-- 部署要求 ONNX 为**纯 CNN 单输入签名** `roi(batch,2,H,W)`（训练时加 `--no-handcrafted`）；
+- 部署要求 ONNX 为**纯 CNN 单输入签名** `roi(batch,2,H,W)`（当前模型即为此签名，无手工特征）；
   若误导出带 `feat` 输入的版本，本脚本会报错提示。
 - 换输入尺寸 H：更新 `config.json` 的 `input_size` 或 `--input-size`（须与导出模型一致）。

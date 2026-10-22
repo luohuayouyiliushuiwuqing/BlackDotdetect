@@ -1,22 +1,18 @@
-# dot 推理部署包（自包含）
+# drone 推理部署包（自包含）
 
-黑色小目标（dot）ONNX 推理。**模型契约：输入 36×36 Y 分量（灰度）图像 → 输出类别（dot / non_dot）+ 置信度。**
+黑色小目标（drone）ONNX 推理。**模型契约：输入 36×36 Y 分量（灰度）图像 → 输出类别（drone / non_drone）+ 置信度。**
 
 仅依赖 `numpy / opencv / onnxruntime`，**不含 PyTorch、不 import 任何训练代码**。
-整个目录（本 README + detect.py + config.json + model.onnx + samples/ + demo.py）
-拷贝到任意机器/目录即可直接运行，路径不硬编码。
 
 ## 目录结构
 
 ```
 deploy/
-├── detect.py          # 推理代码: 模型加载 + 预处理 + 推理 + 后处理(阈值判定)
-├── config.json        # 配置: 模型路径 / 输入尺寸 / 置信度阈值 / 批大小
-├── model.onnx         # ONNX 模型 (单输入 roi(2,36,36) -> 单输出 prob)
-├── samples/           # 内置验证样本 (真实 ROI: 6 dot + 3 non_dot, 尺寸不一)
-├── demo.py            # 一键部署验证
+├── detect.py          # 推理代码: 模型加载 + 预处理 + 推理 + 阈值判定
 └── requirements.txt   # 依赖清单
 ```
+
+模型默认取 `<项目>/runs/dronenet.onnx`（也可用 `--model` 或 `--config` 指定）。
 
 ## 安装
 
@@ -25,32 +21,29 @@ pip install -r requirements.txt
 # 即 numpy + opencv-python-headless + onnxruntime (无其他依赖)
 ```
 
-## 一键验证
+## 标准用法（在项目根目录执行）
 
 ```bash
-python demo.py          # 退出码 0 = 部署可用
+python deploy/detect.py \
+    --input  /home/igs/yhj_demo/PythonProject/BlackDotDataset/data/non_dot/ \
+    --model  /home/igs/yhj_demo/PythonProject/BlackDotdetect/runs/dronenet.onnx
 ```
 
-会用 `samples/` 中 9 张真实 ROI 验证: ① 单张分类与真值一致; ② 批量路径与单张一致。
+- `--input` 传**目录**则批量推理目录下所有 ROI（逐张打印类别与置信度，最后给汇总）；
+  传**单张图像**则只推理这一张。
+- 未传 `--model` 时依次回退：`deploy/model.onnx` → `runs/dronenet.onnx`。
+- `--recursive` 递归扫描子目录；`--output result.json` 保存结构化结果；
+  `--conf 0.8` 提高判定阈值（test 实测 0.8 时零误报）；`--device cuda` 用 GPU。
 
-## 使用
+## 编程接口
 
-```bash
-# 单张 ROI
-python detect.py --model model.onnx --input roi.png
+```python
+from deploy.detect import DroneClassifier
 
-# 批量: 目录下所有图像逐张推理
-python detect.py --input ./rois/ --output result.json
-
-# 通过参数覆盖配置 (模型路径 / 输入尺寸 / 阈值)
-python detect.py --model /data/model.onnx --input roi.png --input-size 36 --conf 0.8 --device cuda
-```
-
-输出示例:
-
-```
-  类别: dot (is_dot=True)
-  置信度: 0.9585   P(dot)=0.9585
+clf = DroneClassifier("runs/dronenet.onnx", input_size=36)
+r = clf.predict(roi_gray)     # {"is_drone": True, "class_name": "drone",
+                              #  "confidence": 0.96, "score": 0.96}
+items = clf.predict_folder("dir/", conf_thr=0.5)   # 目录批量
 ```
 
 ## 编程接口

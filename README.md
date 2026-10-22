@@ -22,30 +22,40 @@ blackdot/
   model.py       # DroneNet 二分类 CNN (~7.6 万参数) + 二分类 Focal Loss
   metrics.py     # P/R/F1 / AUC / AP / 固定 FAR 下召回率
 scripts/
-  train.py           # 训练 + 验证评估 (支持 --init-from 微调)
+  split_data.py       # 按帧分组划分 train/val/test (防同帧泄漏)
+  train.py            # 训练 + 验证评估 (早停, 支持 --init-from 微调)
+  evaluate.py         # 评估指定划分 (test 集) + 阈值扫描 + 失败样本清单
   validate_model.py  # 权重加载/输出合法性/判别正确性冒烟校验
   export_onnx.py     # 导出 ONNX (自包含单文件, 支持纯 CNN 单输入签名)
   verify_onnx.py     # ONNX vs PyTorch 输出一致性对比
   benchmark_onnx.py  # 预处理/推理/端到端时延基准 (按 ROI 折算对比预算)
   baseline_eval.py   # 规则基线评估 (对照组)
+  cross_validate.py  # 留一段视频交叉验证 (跨场景泛化)
 ```
 
 ## 标准流程
 
 ```bash
-# 1) 合成数据预训练
-python scripts/train.py --epochs 30 --n-per-class 5000 --out runs/synth_pre.pt
+# 0) 划分数据 (按帧分组, 防同一帧跨 train/val 泄漏)
+python scripts/split_data.py --src data/base_data --dst data --dry-run   # 先看计划
+python scripts/split_data.py --src data/base_data --dst data
 
-# 2) 实拍数据微调 (目录名含 drone/plane/target/uav/positive 视为正类)
-#    默认开启早停 (--patience 8, 监控 val_loss), 可改 --monitor f1 按业务指标早停
-python scripts/train.py --data-root data --init-from runs/synth_pre.pt --epochs 15 --lr 1e-4
+# 1) 纯实拍训练 (不使用合成数据; 正负比 1:3 时务必加 --pos-weight auto)
+python scripts/train.py --data-root data --epochs 80 --batch-size 32 --lr 3e-4 \
+    --monitor f1 --patience 15 --pos-weight auto --no-handcrafted --out runs/dronenet.pt
 
-# 3) 模型校验
-python scripts/validate_model.py --ckpt runs/finetune.pt
+# 2) 模型校验
+python scripts/validate_model.py --ckpt runs/dronenet.pt
 
-# 4) 导出 + 一致性验证 + 时延基准
-python scripts/export_onnx.py --ckpt runs/finetune.pt --out runs/dronenet.onnx
-python scripts/verify_onnx.py --ckpt runs/finetune.pt --onnx runs/dronenet.onnx
+# 3) 留出测试集评估 (训练脚本只吃 train/val, test 必须单独评估)
+python scripts/evaluate.py --ckpt runs/dronenet.pt --data-root data --split test --sweep
+
+# 4) 跨场景泛化检验 (留一段视频交叉验证, 需 >=2 段不同视频)
+python scripts/cross_validate.py --epochs 30 --batch-size 32
+
+# 5) 导出 + 一致性验证 + 时延基准
+python scripts/export_onnx.py --ckpt runs/dronenet.pt --out runs/dronenet.onnx
+python scripts/verify_onnx.py --ckpt runs/dronenet.pt --onnx runs/dronenet.onnx
 python scripts/benchmark_onnx.py --onnx runs/dronenet.onnx
 ```
 
@@ -56,7 +66,8 @@ data/train/{drone,sky_edge,cloud_edge,background}/*.png    # 也支持 drone/ + 
 data/val/{...}/*.png
 ```
 
-36×36 灰度 ROI（目标居中、外圈 8px 为背景）；不足 36 的部分自动填 0 并用掩码通道标记。
+任意尺寸灰度 ROI（目标居中）：>36 等比缩小到最长边 36 后居中填充、<36 居中放置，
+**只缩不放**，小目标不会被拉伸放大；填充区由掩码通道标记。候选 ROI 由上游检测/滑窗给出。
 **同一视频序列/采集场次只能进一个集合**，不得跨 train/val 拆分相邻帧。
 
 ## 冒烟验证结果（合成数据，1500 样本/类，15 epochs）

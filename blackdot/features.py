@@ -23,13 +23,23 @@ NUM_HANDCRAFTED = 8    # 手工特征维度
 CORE = 20              # 目标区边长: 36x36 画布中心 20x20 为目标区, 外圈 8px 为背景环带
 
 
-def bg_stats(roi: np.ndarray, ring: int = 8) -> tuple[float, float]:
+def default_ring(size: int) -> int:
+    """背景环带宽度: 按 36x36 画布的 8px 比例缩放, 适配任意尺寸的有效 ROI.
+
+    36->8 (目标区 20x20, 与合成管线一致); 24->5; 16->4。
+    """
+    return max(2, int(round(size * 8 / 36)))
+
+
+def bg_stats(roi: np.ndarray, ring: int | None = None) -> tuple[float, float]:
     """由 ROI 外 ring 像素环带估计局部背景均值/标准差.
 
     roi 为 Y 分量灰度块 (H, W), 0~255。若 roi 已含上下文(如 36x36, 中心 20x20
     为目标区), 取四角与环带作为背景; 若无法取环带则退化为全图统计。
     """
     h, w = roi.shape
+    if ring is None:
+        ring = default_ring(min(h, w))
     if h > 2 * ring + 4 and w > 2 * ring + 4:
         ring_mask = np.ones((h, w), dtype=bool)
         ring_mask[ring:-ring, ring:-ring] = False
@@ -39,13 +49,15 @@ def bg_stats(roi: np.ndarray, ring: int = 8) -> tuple[float, float]:
     return float(bg.mean()), float(bg.std() + 1e-6)
 
 
-def core_region(roi: np.ndarray, ring: int = 8) -> np.ndarray:
+def core_region(roi: np.ndarray, ring: int | None = None) -> np.ndarray:
     """截取中心目标区 (36x36 -> 中心 20x20); 无上下文环带时返回原图.
 
     阈值常量按 20x20 目标区标定, 暗像素统计必须只在目标区内进行,
     背景统计量则来自外圈环带 (bg_stats), 否则占比阈值会随画布尺寸失效。
     """
     h, w = roi.shape
+    if ring is None:
+        ring = default_ring(min(h, w))
     if h > 2 * ring + 4 and w > 2 * ring + 4:
         return roi[ring:h - ring, ring:w - ring]
     return roi

@@ -143,11 +143,15 @@ def _make_cloud_edge(rng: np.random.Generator, size: int) -> np.ndarray:
 
 # ---------------- 采样入口 ----------------
 def synth_sample(rng: np.random.Generator, cls: int,
-                 roi: int = ROI, ctx: int = CTX) -> np.ndarray:
-    """生成单个 ROI 样本, 返回 (ctx, ctx) float32 0~255 的完整画布.
+                 roi: int = ROI, ctx: int = CTX,
+                 valid_size: int | None = None) -> np.ndarray:
+    """生成单个 ROI 样本, 返回 float32 0~255 的灰度块.
 
     无人机目标居中(含 ±2px 抖动), 外圈 8px 为背景环带; 边缘/背景类则铺满整幅。
-    直接作为 36x36 模型输入, 不再中心裁剪 —— 保留背景上下文以稳定相对暗判定。
+
+    valid_size: 模拟"本次实际裁剪到的 ROI 边长" (< ctx 时居中裁出该窗口返回)。
+    这样目标的**绝对像素尺寸**不变, 但样本的有效区域可能小于模型画布,
+    与实拍中 ROI 尺寸不一的分布一致 (由 encode_roi 居中补回并置掩码)。
     """
     if cls == 0:
         canvas = make_sky_background(rng, ctx) if rng.random() < 0.6 \
@@ -162,9 +166,12 @@ def synth_sample(rng: np.random.Generator, cls: int,
         canvas = make_sky_background(rng, ctx) if rng.random() < 0.6 \
             else make_cloud_texture(rng, ctx)
         canvas = _degrade(rng, canvas)
-    # 直接返回完整 36x36 画布: 目标居中(无人机)或分界(边缘), 外圈 8px 为背景环带,
-    # 供 handcrafted_features 的 bg_stats 估计局部背景 -> 相对暗判定更稳定。
-    return np.clip(canvas, 0, 255).astype(np.float32)
+    canvas = np.clip(canvas, 0, 255).astype(np.float32)
+    # 模拟"实际裁剪到的 ROI 小于画布": 居中裁出 valid_size 窗口
+    if valid_size is not None and valid_size < ctx:
+        off = (ctx - valid_size) // 2
+        canvas = canvas[off:off + valid_size, off:off + valid_size]
+    return canvas
 
 
 def synth_dataset(n_per_class: int, roi: int = ROI, seed: int = 0

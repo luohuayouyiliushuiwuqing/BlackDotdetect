@@ -43,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-from", type=str, default="",
                    help="预训练权重 .pt 路径, 用于合成预训练→实拍微调; 为空则随机初始化")
     p.add_argument("--no-handcrafted", action="store_true", help="消融: 去掉手工特征分支")
+    p.add_argument("--pos-weight", default="none",
+                   help="正样本(无人机)损失权重: none(默认) | auto(按 train 集 n_neg/n_pos 自动) "
+                        "| 具体数值。纯实拍训练且正负比 >2:1 时建议 auto")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=str, default="runs/dronenet.pt")
@@ -56,11 +59,13 @@ def parse_args() -> argparse.Namespace:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> tuple[float, str, dict]:
+def evaluate(model, loader, device,
+             focal: BinaryFocalLoss | None = None) -> tuple[float, str, dict]:
     """返回 (val_loss, 报告字符串, 指标字典) —— 指标字典供早停监控使用。"""
     model.eval()
     ys, scores, losses = [], [], []
-    focal = BinaryFocalLoss(gamma=2.0).to(device)
+    if focal is None:
+        focal = BinaryFocalLoss(gamma=2.0).to(device)
     for x, feat, label in loader:
         x, feat, label = (x.to(device), feat.to(device), label.to(device))
         logit = model(x, feat)
@@ -76,6 +81,8 @@ def evaluate(model, loader, device) -> tuple[float, str, dict]:
 
 def main() -> None:
     args = parse_args()
+    if args.epochs < 1:
+        raise ValueError(f"--epochs 必须 >= 1, 当前 {args.epochs}")
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
@@ -88,10 +95,23 @@ def main() -> None:
         val_ds = SyntheticROIDataset(max(args.n_per_class // 4, 100),
                                      seed=args.seed + 999, train=False)
 
+    n_train, n_val = len(train_ds), len(val_ds)
+    # 小数据集保护: batch_size >= 样本数时若仍 drop_last=True, DataLoader 会变成 0 批,
+    # 导致 tot/len(train_ld) 除零, 且 sch.step() 先于 opt.step() 触发 LR 调度告警。
+    drop_last = args.batch_size < n_train
+    if not drop_last:
+        print(f"[提示] 训练集 {n_train} 张 <= batch_size {args.batch_size}, "
+              f"已自动改用 drop_last=False (否则每个 epoch 将没有任何 batch)")
     train_ld = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=4, drop_last=True, persistent_workers=True)
+                          num_workers=4, drop_last=drop_last, persistent_workers=True)
     val_ld = DataLoader(val_ds, batch_size=512, num_workers=2,
                         persistent_workers=True)
+    if len(train_ld) == 0 or len(val_ld) == 0:
+        raise ValueError(f"DataLoader 为空: train={n_train} 张({len(train_ld)} 批), "
+                         f"val={n_val} 张({len(val_ld)} 批), 请检查数据与 batch_size")
+    if len(train_ld) < 8 and args.batch_size > 32:
+        print(f"[建议] 训练集仅 {n_train} 张, 每 epoch 只有 {len(train_ld)} 次参数更新; "
+              f"建议 --batch-size 16~32 (并相应增大 --epochs), 否则几乎学不到东西")
 
     model = DroneNet(use_handcrafted=not args.no_handcrafted).to(device)
     print(f"参数量: {count_params(model):,}  设备: {device}")
@@ -105,7 +125,22 @@ def main() -> None:
         if missing or unexpected:
             print("[警告] 权重不完全匹配, 请确认 --no-handcrafted 设置与预训练时一致")
 
-    focal = BinaryFocalLoss(gamma=2.0).to(device)
+    # 正样本加权: 纯实拍训练时正负比常达 1:3, 不加权模型会偏向预测负类、召回偏低
+    pos_weight = None
+    if args.pos_weight == "auto":
+        if hasattr(train_ds, "samples"):        # 实拍: 按真实标签统计
+            n_pos = sum(1 for _, lbl in train_ds.samples if lbl == 1)
+        else:                                    # 合成: 每类均衡 (drone 占 1/4)
+            n_pos = len(train_ds) // 4
+        n_neg = len(train_ds) - n_pos
+        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
+        print(f"[类别加权] train 正样本 {n_pos} / 负样本 {n_neg}, "
+              f"pos_weight={pos_weight.item():.3f}")
+    elif args.pos_weight not in ("none", ""):
+        pos_weight = torch.tensor([float(args.pos_weight)], device=device)
+        print(f"[类别加权] pos_weight={pos_weight.item():.3f} (手动指定)")
+
+    focal = BinaryFocalLoss(gamma=2.0, pos_weight=pos_weight).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
@@ -129,12 +164,13 @@ def main() -> None:
             opt.step()
             tot += loss.item()
         sch.step()
-        val_loss, _, m = evaluate(model, val_ld, device)
+        val_loss, _, m = evaluate(model, val_ld, device, focal=focal)
         cur = -val_loss if args.monitor == "val_loss" else float(m[args.monitor])
         shown = val_loss if args.monitor == "val_loss" else cur
+        # f1/auc 始终打印 (便于观察业务指标随轮次的走势), 末尾再标出监控项
         print(f"[epoch {ep:02d}] train_loss={tot / len(train_ld):.4f} "
-              f"val_loss={val_loss:.4f} {args.monitor}={shown:.4f} "
-              f"({time.time() - t0:.1f}s)")
+              f"val_loss={val_loss:.4f} f1={m['f1']:.4f} auc={m['auc']:.4f} "
+              f"| monitor {args.monitor}={shown:.4f} ({time.time() - t0:.1f}s)")
 
         if cur > best + args.min_delta:
             best = cur
@@ -157,6 +193,8 @@ def main() -> None:
     _, rep, _ = evaluate(model, val_ld, device)
     tail = f" (早停于第 {stopped_epoch} 轮)" if stopped_epoch else ""
     print(f"\n最优模型已保存到 {out_path} [监控 {args.monitor}]{tail}\n\n{rep}")
+    print("提示: 早停是在 val 上挑的最优轮, 该 val 指标存在选择偏差; "
+          "最终结论请用 scripts/evaluate.py 在 test 集上复核")
 
 
 if __name__ == "__main__":

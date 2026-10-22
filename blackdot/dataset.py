@@ -25,16 +25,36 @@ from .synthesis import ROI, synth_sample
 def encode_roi(roi_gray: np.ndarray, out: int = ROI) -> tuple[np.ndarray, np.ndarray]:
     """将任意尺寸 Y ROI 编码为 (2, out, out) 张量 + 8 维手工特征.
 
-    不足 out 的部分右侧/下侧填 0, 掩码通道标记有效像素 (设计方案 2.1)。
+    尺度处理原则 (方案 B): **绝不放大**
+      - ROI > out : 等比缩小到最长边 = out (INTER_AREA, 保留全部内容, 不裁掉周围),
+                    再居中填充到 out×out, 填充区掩码置 0
+      - ROI < out : 居中放入 out 画布, 四周填 0 且掩码置 0 (保持像素尺度, 不放大)
+    小目标因此永远不会被拉伸放大; 掩码通道告知网络哪些区域是填充。
+
+    手工特征只在**有效区域**上计算, 避免把填充的 0 当成暗像素。
     """
+    roi_gray = np.asarray(roi_gray)
     h, w = roi_gray.shape
+
+    # 超界: 等比缩小(保留全部内容); 非方形缩小后仍需居中填充
+    if max(h, w) > out:
+        scale = out / float(max(h, w))
+        nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+        patch = cv2.resize(roi_gray, (nw, nh), interpolation=cv2.INTER_AREA)
+    else:
+        patch = roi_gray
+
+    ph, pw = patch.shape[:2]
+    ch, cw = min(ph, out), min(pw, out)
     canvas = np.zeros((out, out), np.float32)
     mask = np.zeros((out, out), np.float32)
-    hh, ww = min(h, out), min(w, out)
-    canvas[:hh, :ww] = roi_gray[:hh, :ww] / 255.0
-    mask[:hh, :ww] = 1.0
-    x = np.stack([canvas, mask])                       # (2, out, out)
-    feat = handcrafted_features(roi_gray.astype(np.float32))
+    sy, sx = (ph - ch) // 2, (pw - cw) // 2        # 源: 居中
+    oy, ox = (out - ch) // 2, (out - cw) // 2      # 目标: 居中放置
+    canvas[oy:oy + ch, ox:ox + cw] = patch[sy:sy + ch, sx:sx + cw] / 255.0
+    mask[oy:oy + ch, ox:ox + cw] = 1.0
+
+    x = np.stack([canvas, mask])                   # (2, out, out)
+    feat = handcrafted_features(patch.astype(np.float32))
     return x, feat
 
 
@@ -56,12 +76,22 @@ def augment(rng: np.random.Generator, img: np.ndarray) -> np.ndarray:
 
 
 class SyntheticROIDataset(Dataset):
-    """在线合成数据集 (每次 __getitem__ 重新采样, 等价无限数据)."""
+    """在线合成数据集 (每次 __getitem__ 重新采样, 等价无限数据).
 
-    def __init__(self, n_per_class: int, seed: int = 0, train: bool = True):
+    crop_prob / min_valid: 模拟实拍中"ROI 尺寸不一"的实际情况——
+    以 crop_prob 的概率把 36x36 画布裁成 [min_valid, 36] 的居中窗口作为
+    "本次裁剪到的 ROI", 再由 encode_roi 居中放回 36x36 并置掩码。
+    目标绝对像素尺寸不变, 但训练时能见到"有效区域小于画布"的样本,
+    与实拍分布对齐 (实测实拍仅 4.2% 是 36x36)。
+    """
+
+    def __init__(self, n_per_class: int, seed: int = 0, train: bool = True,
+                 crop_prob: float = 0.6, min_valid: int = 12):
         self.n_per_class = n_per_class
         self.train = train
         self.seed = seed
+        self.crop_prob = crop_prob
+        self.min_valid = min_valid
         self.n = n_per_class * 4
 
     def __len__(self) -> int:
@@ -70,7 +100,10 @@ class SyntheticROIDataset(Dataset):
     def __getitem__(self, idx: int):
         rng = np.random.default_rng(self.seed * 1_000_003 + idx)
         cls = idx % 4
-        img = synth_sample(rng, cls)
+        valid = ROI
+        if self.crop_prob > 0 and rng.random() < self.crop_prob:
+            valid = int(rng.integers(self.min_valid, ROI + 1))
+        img = synth_sample(rng, cls, valid_size=valid)
         if self.train:
             img = augment(rng, img)
         x, feat = encode_roi(img)
@@ -91,7 +124,8 @@ class FolderROIDataset(Dataset):
       ② 兼容旧四类: root/{drone,sky_edge,cloud_edge,background}/*.png,
          仅 drone 为正, 其余三类自动并入负类
     标签规则: 以图像所在子目录名是否 ∈ POSITIVE_NAMES 判定正负。
-    图像读取后转灰度, resize 到 36x36 (INTER_AREA); 目标应大致居中、外圈为背景。
+    图像读取后转灰度 (Y); **不缩放**——由 encode_roi 居中裁剪/居中放置到 36x36,
+    保持目标真实像素尺度 (方案 B)。构图要求: 目标大致居中。
     """
 
     def __init__(self, root: str | Path, train: bool = True, seed: int = 0):
@@ -118,8 +152,7 @@ class FolderROIDataset(Dataset):
         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise ValueError(f"无法读取 {path}")
-        img = cv2.resize(img, (ROI, ROI), interpolation=cv2.INTER_AREA)
-        img = img.astype(np.float32)
+        img = img.astype(np.float32)   # 不 resize: 由 encode_roi 居中处理, 保持尺度
         if self.train:
             img = augment(self.rng, img)
         x, feat = encode_roi(img)

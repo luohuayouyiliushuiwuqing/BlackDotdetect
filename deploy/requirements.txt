@@ -1,0 +1,10 @@
+# 部署依赖 (自包含推理, 不含任何训练框架)
+numpy>=1.24
+opencv-python-headless>=4.8
+onnxruntime>=1.15
+
+# 说明:
+#   opencv-python-headless 为无 GUI 版本, 适合服务器/嵌入式;
+#   若需 cv2.imshow 可视化, 改为 opencv-python。
+#   需要 GPU 推理时, 把 onnxruntime 换成 onnxruntime-gpu (版本需匹配 CUDA)。
+#   本目录不依赖 torch / ultralytics / 训练代码中的任何模块。
